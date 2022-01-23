@@ -1,7 +1,5 @@
 ---
 title: golang栈stack
-date: 2022-01-21 15:42:23
-tags:
 ---
 
 # 1. 介绍
