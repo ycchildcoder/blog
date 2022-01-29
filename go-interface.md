@@ -1,6 +1,6 @@
 ---
-title: golang map初始化及使用
-date: 2022-01-21 15:42:23
+title: golang interface
+date: 2022-01-28 17:42:23
 tags:
 ---
 
