@@ -1,0 +1,671 @@
+---
+title: Go grpc
+date: 2022-02-11 16:41:46
+tags:
+---
+
+gRPC是Google公司基于Protobuf开发的跨语言的开源RPC框架。gRPC基于HTTP/2协议设计
+
+如果从Protobuf的角度看，gRPC只不过是一个针对service接口生成代码的生成器。
+
+环境搭建
+
+## 安装 protobuf
+
+`grpc`使用`protobuf`作为`IDL(interface descriton language)`，且要求`protobuf 3.0`以上，这里我们直接选用当前最新版本 3.8，[git下载地址](https://link.segmentfault.com/?enc=Zf5xshJRLvKVXC0jT8mgQQ%3D%3D.VDWBQdbdnK1Ynd2aNUNJvqoR9iR89vWOTVPtmf9H7uGi%2FzoU54Je2LDMqWPiWGQv8%2B99PdaDu05RrsKyH1jWSQ%3D%3D)。https://github.com/protocolbuffers/protobuf/releases
+
+选择操作系统对应的版本下载，这里我们直接使用已经编译好的`protoc`可执行文件（或者下载安装包编译安装）。
+
+```awk
+wget https://github.com/protocolbuffers/protobuf/releases/download/v3.8.0-rc1/protoc-3.8.0-rc-1-linux-x86_64.zip
+tar -zxvf protoc-3.8.0-rc-1-linux-x86_64.zip
+mv protoc-3.8.0-rc-1-linux-x86_64 /usr/local/protoc
+ln -s /usr/local/protoc/bin/protoc /usr/local/bin/protoc
+#查看 protoc
+protoc --version
+```
+
+## 安装 protoc-gen-go
+
+`protoc-gen-go`是`Go`的`protoc`编译插件，`protobuf`内置了许多高级语言的编译器，但没有`Go`的。
+
+```routeros
+# 运行 protoc -h 命令可以发现内置的只支持以下语言
+protoc -h
+...
+--cpp_out=OUT_DIR           Generate C++ header and source.
+--csharp_out=OUT_DIR        Generate C# source file.
+--java_out=OUT_DIR          Generate Java source file.
+--js_out=OUT_DIR            Generate JavaScript source.
+--objc_out=OUT_DIR          Generate Objective C header and source.
+--php_out=OUT_DIR           Generate PHP source file.
+--python_out=OUT_DIR        Generate Python source file.
+--ruby_out=OUT_DIR          Generate Ruby source file.
+...
+```
+
+所以我们使用`protoc`编译生成`Go`版的`grpc`时，需要先安装此插件。
+
+```vim
+go get -u github.com/golang/protobuf/protoc-gen-go
+```
+
+## 安装 grpc-go 库
+
+`grpc-go`包含了`Go`的`grpc`库。
+
+`go get google.golang.org/grpc` 可能会被墙掉了，使用如下方式手动安装。
+
+```awk
+git clone https://github.com/grpc/grpc-go.git $GOPATH/src/google.golang.org/grpc
+git clone https://github.com/golang/net.git $GOPATH/src/golang.org/x/net
+git clone https://github.com/golang/text.git $GOPATH/src/golang.org/x/text
+git clone https://github.com/google/go-genproto.git $GOPATH/src/google.golang.org/genproto
+
+cd $GOPATH/src/
+go install google.golang.org/grpc
+```
+
+
+
+创建hello.proto文件，定义HelloService接口：
+
+```proto
+syntax = "proto3";
+
+package main;
+
+message String {
+    string value = 1;
+}
+
+service HelloService {
+    rpc Hello (String) returns (String);
+}
+```
+
+使用protoc-gen-go内置的gRPC插件生成gRPC代码：
+
+```
+$ protoc --go_out=plugins=grpc:. hello.proto
+```
+
+gRPC插件会为服务端和客户端生成不同的接口：
+
+```go
+type HelloServiceServer interface {
+    Hello(context.Context, *String) (*String, error)
+}
+
+type HelloServiceClient interface {
+    Hello(context.Context, *String, ...grpc.CallOption) (*String, error)
+}
+```
+
+gRPC通过context.Context参数，为每个方法调用提供了上下文支持。客户端在调用方法的时候，可以通过可选的grpc.CallOption类型的参数提供额外的上下文信息。
+
+基于服务端的HelloServiceServer接口可以重新实现HelloService服务：
+
+```go
+type HelloServiceImpl struct{}
+
+func (p *HelloServiceImpl) Hello(
+    ctx context.Context, args *String,
+) (*String, error) {
+    reply := &String{Value: "hello:" + args.GetValue()}
+    return reply, nil
+}
+```
+
+gRPC服务的启动流程和标准库的RPC服务启动流程类似：
+
+```go
+func main() {
+    grpcServer := grpc.NewServer()
+    RegisterHelloServiceServer(grpcServer, new(HelloServiceImpl))
+
+    lis, err := net.Listen("tcp", ":1234")
+    if err != nil {
+        log.Fatal(err)
+    }
+    grpcServer.Serve(lis)
+}
+```
+
+首先是通过`grpc.NewServer()`构造一个gRPC服务对象，然后通过gRPC插件生成的RegisterHelloServiceServer函数注册我们实现的HelloServiceImpl服务。然后通过`grpcServer.Serve(lis)`在一个监听端口上提供gRPC服务。
+
+然后就可以通过客户端链接gRPC服务了：
+
+```go
+func main() {
+    conn, err := grpc.Dial("localhost:1234", grpc.WithInsecure())
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer conn.Close()
+
+    client := NewHelloServiceClient(conn)
+    reply, err := client.Hello(context.Background(), &String{Value: "hello"})
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println(reply.GetValue())
+}
+```
+
+其中grpc.Dial负责和gRPC服务建立链接，然后NewHelloServiceClient函数基于已经建立的链接构造HelloServiceClient对象。返回的client其实是一个HelloServiceClient接口对象，通过接口定义的方法就可以调用服务端对应的gRPC服务提供的方法。
+
+## 实战例子
+
+proto文件
+
+```
+syntax = "proto3";
+
+package proto;
+option go_package = ".;proto";
+
+message User {
+    string name=1;
+    int32 age=2;
+}
+message Id {
+    int32 uid=1;
+}
+//要生成server rpc代码
+service ServiceSearch{
+    rpc SaveUser(User) returns (Id){}
+    rpc UserInfo(Id) returns (User){}
+}
+```
+
+
+
+$ protoc --go_out=plugins=grpc:. hello.proto
+
+推荐
+
+```
+go get github.com/gogo/protobuf/proto
+go get github.com/gogo/protobuf/protoc-gen-gogofaster //protoc-gen-gogofast、protoc-gen-gogofaster 、protoc-gen-gogoslick 
+go get github.com/gogo/protobuf/gogoproto
+
+protoc -I=. -I=$GOPATH/src -I=$GOPATH/src/github.com/gogo/protobuf -I=$GOPATH/src/github.com/gogo/protobuf/protobuf --gogofaster_out=. rpc.proto
+```
+
+生成出含有RegisterService 的grpc 应用
+
+```
+protoc -I=. -I=$GOPATH/src -I=$GOPATH/src/github.com/gogo/protobuf/protobuf --gogofaster_out=plugins=grpc:. rpc.proto
+```
+
+生成hello.pb.go，摘取重要 部分
+
+```go
+// Code generated by protoc-gen-gogo. DO NOT EDIT.
+// source: hello.proto
+
+type User struct {
+   Name string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+   Age  int32  `protobuf:"varint,2,opt,name=age,proto3" json:"age,omitempty"`
+}
+
+type Id struct {
+   Uid int32 `protobuf:"varint,1,opt,name=uid,proto3" json:"uid,omitempty"`
+}
+
+func init() {
+   proto.RegisterType((*User)(nil), "proto.User")
+   proto.RegisterType((*Id)(nil), "proto.Id")
+}
+
+func init() { proto.RegisterFile("hello.proto", fileDescriptor_61ef911816e0a8ce) }
+
+
+// ServiceSearchClient is the client API for ServiceSearch service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://godoc.org/google.golang.org/grpc#ClientConn.NewStream.
+type ServiceSearchClient interface {
+   SaveUser(ctx context.Context, in *User, opts ...grpc.CallOption) (*Id, error)
+   UserInfo(ctx context.Context, in *Id, opts ...grpc.CallOption) (*User, error)
+}
+
+type serviceSearchClient struct {
+   cc *grpc.ClientConn
+}
+
+func NewServiceSearchClient(cc *grpc.ClientConn) ServiceSearchClient {
+   return &serviceSearchClient{cc}
+}
+
+func (c *serviceSearchClient) SaveUser(ctx context.Context, in *User, opts ...grpc.CallOption) (*Id, error) {
+   out := new(Id)
+   err := c.cc.Invoke(ctx, "/proto.ServiceSearch/SaveUser", in, out, opts...)
+   if err != nil {
+      return nil, err
+   }
+   return out, nil
+}
+
+func (c *serviceSearchClient) UserInfo(ctx context.Context, in *Id, opts ...grpc.CallOption) (*User, error) {
+   out := new(User)
+   err := c.cc.Invoke(ctx, "/proto.ServiceSearch/UserInfo", in, out, opts...)
+   if err != nil {
+      return nil, err
+   }
+   return out, nil
+}
+
+// ServiceSearchServer is the server API for ServiceSearch service.
+type ServiceSearchServer interface {
+   SaveUser(context.Context, *User) (*Id, error)
+   UserInfo(context.Context, *Id) (*User, error)
+}
+
+// UnimplementedServiceSearchServer can be embedded to have forward compatible implementations.
+type UnimplementedServiceSearchServer struct {
+}
+
+func (*UnimplementedServiceSearchServer) SaveUser(ctx context.Context, req *User) (*Id, error) {
+   return nil, status.Errorf(codes.Unimplemented, "method SaveUser not implemented")
+}
+func (*UnimplementedServiceSearchServer) UserInfo(ctx context.Context, req *Id) (*User, error) {
+   return nil, status.Errorf(codes.Unimplemented, "method UserInfo not implemented")
+}
+
+func RegisterServiceSearchServer(s *grpc.Server, srv ServiceSearchServer) {
+   s.RegisterService(&_ServiceSearch_serviceDesc, srv)
+}
+
+```
+
+
+
+client
+
+```go
+package main
+
+import (
+   proto "awesomeProject/001/templete/005/pb"
+   "context"
+   "google.golang.org/grpc"
+   "log"
+   "time"
+)
+
+const (
+   address     = "localhost:50051"
+   defaultName = "world"
+)
+
+func main() {
+   //con, err := grpc.Dial(address, grpc.WithInsecure(), grpc.WithBlock(), grpc.WithTimeout(time.Second))
+   ctx, cancle := context.WithTimeout(context.Background(), time.Second)
+   defer cancle()
+   con, err := grpc.DialContext(ctx, address, grpc.WithInsecure(), grpc.WithBlock())
+   if err != nil {
+      log.Fatal("dial error")
+      return
+   }
+
+   defer con.Close()
+
+   c := proto.NewServiceSearchClient(con)
+
+   ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+   defer cancel()
+
+   //r, err := c.SaveUser(ctx, &proto.User{Name: defaultName, Age: 18})
+   //if err != nil {
+   // log.Fatalf("save user error")
+   //}
+   //
+   //log.Println(r.String())
+
+   u, err := c.UserInfo(ctx, &proto.Id{284})
+   if err != nil {
+      log.Fatalln("user ifno error", err.Error())
+   }
+   log.Println(u.String())
+}
+```
+
+server 
+
+```go
+package main
+
+import (
+   proto "awesomeProject/001/templete/005/pb"
+   "context"
+   "fmt"
+   "google.golang.org/grpc"
+   "log"
+   "math/rand"
+   "net"
+   "time"
+)
+
+const (
+   port = ":50051"
+)
+
+var user = make(map[proto.Id]proto.User)
+
+type server struct {
+   proto.UnimplementedServiceSearchServer
+}
+
+func (s *server) SaveUser(ctx context.Context, req *proto.User) (*proto.Id, error) {
+   rand.Seed(time.Now().Unix())
+   id := proto.Id{rand.Int31n(1000)}
+   if _, ok := user[id]; ok {
+      return nil, fmt.Errorf("existed")
+   }
+   user[id] = *req
+   return &id, nil
+}
+
+func (s *server) UserInfo(ctx context.Context, req *proto.Id) (*proto.User, error) {
+   if u, ok := user[*req]; ok {
+      return &u, nil
+   }
+   return nil, fmt.Errorf("not existed")
+}
+func main() {
+   lis, err := net.Listen("tcp", port)
+   if err != nil {
+      log.Fatalf("failed to listen")
+   }
+
+   s := grpc.NewServer()
+
+   proto.RegisterServiceSearchServer(s, &server{})
+
+   log.Println("start to lister ...")
+   if err := s.Serve(lis); err != nil {
+      log.Fatalf("error")
+   }
+}
+```
+
+
+
+转一篇：
+
+RPC算是近些年比较火热的概念了，随着微服务架构的兴起，RPC的应用越来越广泛。本文介绍了RPC和gRPC的相关概念，并且通过详细的代码示例介绍了gRPC的基本使用。
+
+# gRPC
+
+## RPC是什么
+
+在分布式计算，远程过程调用（英语：Remote Procedure Call，缩写为 RPC）是一个计算机通信协议。该协议允许运行于一台计算机的程序调用另一个地址空间（通常为一个开放网络的一台计算机）的子程序，而程序员就像调用本地程序一样，无需额外地为这个交互作用编程（无需关注细节）。RPC是一种服务器-客户端（Client/Server）模式，经典实现是一个通过`发送请求-接受回应`进行信息交互的系统。
+
+## gRPC是什么
+
+`gRPC`是一种现代化开源的高性能RPC框架，能够运行于任意环境之中。最初由谷歌进行开发。它使用HTTP/2作为传输协议。
+
+在gRPC里，客户端可以像调用本地方法一样直接调用其他机器上的服务端应用程序的方法，帮助你更容易创建分布式应用程序和服务。与许多RPC系统一样，gRPC是基于定义一个服务，指定一个可以远程调用的带有参数和返回类型的的方法。在服务端程序中实现这个接口并且运行gRPC服务处理客户端调用。在客户端，有一个stub提供和服务端相同的方法。
+
+![grpc](https://raw.githubusercontent.com/ycchildcoder/markdown/main/grpc.svg)
+
+## 为什么要用gRPC
+
+使用gRPC， 我们可以一次性的在一个`.proto`文件中定义服务并使用任何支持它的语言去实现客户端和服务端，反过来，它们可以应用在各种场景中，从Google的服务器到你自己的平板电脑—— gRPC帮你解决了不同语言及环境间通信的复杂性。使用`protocol buffers`还能获得其他好处，包括高效的序列号，简单的IDL以及容易进行接口更新。总之一句话，使用gRPC能让我们更容易编写跨语言的分布式代码。
+
+## 安装gRPC
+
+### 安装gRPC
+
+```bash
+go get -u google.golang.org/grpc
+```
+
+### 安装Protocol Buffers v3
+
+安装用于生成gRPC服务代码的协议编译器，最简单的方法是从下面的链接：https://github.com/google/protobuf/releases下载适合你平台的预编译好的二进制文件（`protoc-<version>-<platform>.zip`）。
+
+下载完之后，执行下面的步骤：
+
+1.  解压下载好的文件
+2.  把`protoc`二进制文件的路径加到环境变量中
+
+接下来执行下面的命令安装protoc的Go插件：
+
+```bash
+go get -u github.com/golang/protobuf/protoc-gen-go
+```
+
+编译插件`protoc-gen-go`将会安装到`$GOBIN`，默认是`$GOPATH/bin`，它必须在你的`$PATH`中以便协议编译器`protoc`能够找到它。
+
+### 安装指定
+
+## gRPC开发分三步
+
+把大象放进冰箱分几步？
+
+1.  把冰箱门打开。
+2.  把大象放进去。
+3.  把冰箱门带上。
+
+gRPC开发同样分三步：
+
+1.  编写`.proto`文件，生成指定语言源代码。
+2.  编写服务端代码
+3.  编写客户端代码
+
+## gRPC入门示例
+
+### 编写proto代码
+
+gRPC是基于Protocol Buffers。
+
+`Protocol Buffers`是一种与语言无关，平台无关的可扩展机制，用于序列化结构化数据。使用`Protocol Buffers`可以一次定义结构化的数据，然后可以使用特殊生成的源代码轻松地在各种数据流中使用各种语言编写和读取结构化数据。
+
+关于`Protocol Buffers`的教程可以自行在网上搜索，本文默认读者熟悉`Protocol Buffers`。
+
+```protobuf
+syntax = "proto3"; // 版本声明，使用Protocol Buffers v3版本
+
+package pb; // 包名
+
+
+// 定义一个打招呼服务
+service Greeter {
+    // SayHello 方法
+    rpc SayHello (HelloRequest) returns (HelloReply) {}
+}
+
+// 包含人名的一个请求消息
+message HelloRequest {
+    string name = 1;
+}
+
+// 包含问候语的响应消息
+message HelloReply {
+    string message = 1;
+}
+```
+
+执行下面的命令，生成go语言源代码：
+
+```bash
+protoc -I helloworld/ helloworld/pb/helloworld.proto --go_out=plugins=grpc:helloworld
+```
+
+在`gRPC_demo/helloworld/pb`目录下会生成`helloworld.pb.go`文件。
+
+### 编写Server端Go代码
+
+```go
+package main
+
+import (
+	"fmt"
+	"net"
+
+	pb "gRPC_demo/helloworld/pb"
+	"golang.org/x/net/context"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/reflection"
+)
+
+type server struct{}
+
+func (s *server) SayHello(ctx context.Context, in *pb.HelloRequest) (*pb.HelloReply, error) {
+	return &pb.HelloReply{Message: "Hello " + in.Name}, nil
+}
+
+func main() {
+	// 监听本地的8972端口
+	lis, err := net.Listen("tcp", ":8972")
+	if err != nil {
+		fmt.Printf("failed to listen: %v", err)
+		return
+	}
+	s := grpc.NewServer() // 创建gRPC服务器
+	pb.RegisterGreeterServer(s, &server{}) // 在gRPC服务端注册服务
+
+	reflection.Register(s) //在给定的gRPC服务器上注册服务器反射服务
+	// Serve方法在lis上接受传入连接，为每个连接创建一个ServerTransport和server的goroutine。
+	// 该goroutine读取gRPC请求，然后调用已注册的处理程序来响应它们。
+	err = s.Serve(lis)
+	if err != nil {
+		fmt.Printf("failed to serve: %v", err)
+		return
+	}
+}
+```
+
+将上面的代码保存到`gRPC_demo/helloworld/server/server.go`文件中，编译并执行：
+
+```bash
+cd helloworld/server
+go build
+./server
+```
+
+### 编写Client端Go代码
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+
+	pb "gRPC_demo/helloworld/pb"
+	"google.golang.org/grpc"
+)
+
+func main() {
+	// 连接服务器
+	conn, err := grpc.Dial(":8972", grpc.WithInsecure())
+	if err != nil {
+		fmt.Printf("faild to connect: %v", err)
+	}
+	defer conn.Close()
+
+	c := pb.NewGreeterClient(conn)
+	// 调用服务端的SayHello
+	r, err := c.SayHello(context.Background(), &pb.HelloRequest{Name: "q1mi"})
+	if err != nil {
+		fmt.Printf("could not greet: %v", err)
+	}
+	fmt.Printf("Greeting: %s !\n", r.Message)
+}
+```
+
+将上面的代码保存到`gRPC_demo/helloworld/client/client.go`文件中，编译并执行：
+
+```bash
+cd helloworld/client/
+go build
+./client
+```
+
+得到输出如下（注意要先启动server端再启动client端）：
+
+```bash
+$ ./client 
+Greeting: Hello q1mi!
+```
+
+此时我们的目录结构如下：
+
+```bash
+./gRPC_demo
+├── go.mod
+├── go.sum
+└── helloworld
+    ├── client
+    │   ├── client
+    │   └── client.go
+    │   ├── client.py
+    ├── pb
+    │   ├── helloworld.pb.go
+    │   └── helloworld.proto
+    └── server
+        ├── server
+        └── server.go
+```
+
+### gRPC跨语言调用
+
+接下来，我们演示一下如何使用gRPC实现跨语言的RPC调用。
+
+我们使用`Python`语言编写`Client`，然后向上面使用`go`语言编写的`server`发送RPC请求。
+
+### 生成Python代码
+
+在`gRPC_demo`目录执行下面的命令：
+
+```bash
+python -m grpc_tools.protoc -I helloworld/pb/ --python_out=helloworld/client/ --grpc_python_out=helloworld/client/ helloworld/pb/helloworld.proto
+```
+
+上面的命令会在`gRPC_demo/helloworld/client/`目录生成如下两个python文件：
+
+```bash
+helloworld_pb2.py
+helloworld_pb2_grpc.py
+```
+
+### 编写Python版Client
+
+在``gRPC_demo/helloworld/client/`目录闯将`client.py`文件，其内容如下：
+
+```python
+# coding=utf-8
+
+import logging
+
+import grpc
+
+import helloworld_pb2
+import helloworld_pb2_grpc
+
+
+def run():
+    # 注意(gRPC Python Team): .close()方法在channel上是可用的。
+    # 并且应该在with语句不符合代码需求的情况下使用。
+    with grpc.insecure_channel('localhost:8972') as channel:
+        stub = helloworld_pb2_grpc.GreeterStub(channel)
+        response = stub.SayHello(helloworld_pb2.HelloRequest(name='q1mi'))
+    print("Greeter client received: {}!".format(response.message))
+
+
+if __name__ == '__main__':
+    logging.basicConfig()
+    run()
+```
+
+将上面的代码保存执行，得到输出结果如下：
+
+```bash
+gRPC_demo $ python helloworld/client/client.py 
+Greeter client received: Hello q1mi!
+```
+
+这里我们就实现了，使用python代码编写的client去调用Go语言版本的server了。

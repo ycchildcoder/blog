@@ -12,7 +12,33 @@ tags:
 
 # 有什么用
 
-对于很多需要重复分配、回收内存的地方，`sync.Pool` 是一个很好的选择。频繁地分配、回收内存会给 GC 带来一定的负担，严重的时候会引起 CPU 的毛刺，而 `sync.Pool` 可以将暂时不用的对象缓存起来，待下次需要的时候直接使用，不用再次经过内存分配，复用对象的内存，减轻 GC 的压力，提升系统的性能。
+对于很多需要重复分配、回收内存的地方，`sync.Pool` 是一个很好的选择。因为`Go`的gc算法是根据标记清除改进的三色标记法，频繁地分配、回收内存会给 GC 带来一定的负担，严重的时候会引起 CPU 的毛刺，而 `sync.Pool` 可以将暂时不用的对象缓存起来，待下次需要的时候直接使用，不用再次经过内存分配，复用对象的内存，减轻 GC 的压力，提升系统的性能。
+
+当然需要注意的是：**存储在`Pool`中的对象随时都可能在不被通知的情况下被移除。所以并不是所有频繁使用、创建昂贵的对象都适用，比如DB连接、线程池**。
+
+# 区别
+
+为了缓解GC压力，go标准库在sync包中提供了一个Pool，但是这个Pool和我们一般意义上的Pool不太一样，主要有以下几点区别:
+ 1.Pool无法设置大小，所以理论上只受限于系统内存大小。
+ 2.Pool中的对象不支持自定义过期时间及策略，究其原因，Pool并不是一个Cache.
+ 3.Pool的设计初衷是为了缓解GC压力，所以Pool中的对象会在GC开始前全部清除。
+ 下面这段注释来源于pool.go:
+
+```go
+// A Pool is a set of temporary objects that may be individually saved and
+// retrieved.
+//
+// Any item stored in the Pool may be removed automatically at any time without
+// notification. If the Pool holds the only reference when this happens, the
+// item might be deallocated.
+//
+// A Pool is safe for use by multiple goroutines simultaneously.
+//
+// Pool's purpose is to cache allocated but unused items for later reuse,
+// relieving pressure on the garbage collector. That is, it makes it easy to
+// build efficient, thread-safe free lists. However, it is not suitable for all
+// free lists.
+```
 
 # 怎么用
 
@@ -25,6 +51,22 @@ tags:
 >   在这个时候，需要有⼀个对象池，每个 goroutine 不再⾃⼰单独创建对象，⽽是从对象池中获取出⼀个对象（如果池中已经有的话）。
 
 因此关键思想就是对象的复用，避免重复创建、销毁，下面我们来看看如何使用。
+
+1.New
+
+Pool struct 包含一个 New 字段，这个字段的类型是函数 func() interface{}。当调用 Pool 的 Get 方法从池中获取元素，没有更多的空闲元素可返回时，就会调用这个 New 方法来创建新的元素。如果你没有设置 New 字段，没有更多的空闲元素可返回时，Get 方法将返回 nil，表明当前没有可用的元素。
+
+2.Get
+
+如果调用这个方法，就会从 Pool取走一个元素，这也就意味着，这个元素会从 Pool 中移除，返回给调用者。不过，除了返回值是正常实例化的元素，Get 方法的返回值还可能会是一个 nil（Pool.New 字段没有设置，又没有空闲元素可以返回），所以你在使用的时候，可能需要判断。
+
+3.Put
+
+这个方法用于将一个元素返还给 Pool，Pool 会把这个元素保存到池中，并且可以复用。但如果 Put 一个 nil 值，Pool 就会忽略这个值。
+
+
+
+
 
 ## 简单的例子
 
@@ -142,6 +184,125 @@ func (p *pp) free() {
 
 归还到 Pool 前将对象的一些字段清零，这样，通过 Get 拿到缓存的对象时，就可以安全地使用了。
 
+### bytes.Buffer
+
+再看一个例子这个例子使用bytes.Buffer
+
+```go
+GO
+var bufferPool = sync.Pool{
+	New: func() interface{} {
+		return &bytes.Buffer{}
+	},
+}
+
+var data = make([]byte, 10000)
+
+func BenchmarkBufferWithPool(b *testing.B) {
+	for n := 0; n < b.N; n++ {
+		buf := bufferPool.Get().(*bytes.Buffer)
+		buf.Write(data)
+		buf.Reset()
+		bufferPool.Put(buf)
+	}
+}
+
+func BenchmarkBuffer(b *testing.B) {
+	for n := 0; n < b.N; n++ {
+		var buf bytes.Buffer
+		buf.Write(data)
+	}
+}
+```
+
+但在实际使用的时候，最好做到物尽其用，尽可能不浪费，我们可以将 buffer 池分成几层。首先，小于 512 byte 的元素的 buffer 占一个池子；其次，小于 1K byte 大小的元素占一个池子；再次，小于 4K byte 大小的元素占一个池子。这样分成几个池子以后，就可以根据需要，到所需大小的池子中获取 buffer 了。
+
+**这个例子中要注意一个坑：**
+
+取出来的 bytes.Buffer 在使用的时候，我们可以往这个元素中增加大量的 byte 数据，这会导致底层的 byte slice 的容量可能会变得很大。这个时候，即使 Reset 再放回到池子中，这些 byte slice 的容量不会改变，所占的空间依然很大。而且，因为 Pool 回收的机制，这些大的 Buffer 可能不被回收，而是会一直占用很大的空间，这属于内存泄漏的问题。
+
+比如 encoding、json 就出现了类似的问题：将容量已经变得很大的 Buffer 再放回 Pool 中，导致内存泄漏。
+
+**解决方法是：在元素放回时，增加了检查逻辑，改成放回的超过一定大小的 buffer，就直接丢弃掉，不再PUT到池子中。**
+
+
+
+sync.Pool 的数据结构：
+
+![111](https://raw.githubusercontent.com/ycchildcoder/markdown/main/111.jpg)
+
+![image-20220209141430465](https://raw.githubusercontent.com/ycchildcoder/markdown/main/image-20220209141430465.png)
+
+![image-20220209141917178](https://raw.githubusercontent.com/ycchildcoder/markdown/main/image-20220209141917178.png)
+
+![image-20220209142011469](https://raw.githubusercontent.com/ycchildcoder/markdown/main/image-20220209142011469.png)
+
+![image-20220209142143406](https://raw.githubusercontent.com/ycchildcoder/markdown/main/image-20220209142143406.png)
+
+![image-20220209142451160](https://raw.githubusercontent.com/ycchildcoder/markdown/main/image-20220209142451160.png)
+
+### getSlow
+
+如果在 shared 里没有获取到缓存对象，则继续调用 `Pool.getSlow()`，尝试从其他 P 的 poolLocal 偷取：
+
+```golang
+func (p *Pool) getSlow(pid int) interface{} {
+	// See the comment in pin regarding ordering of the loads.
+	size := atomic.LoadUintptr(&p.localSize) // load-acquire
+	locals := p.local                        // load-consume
+	// Try to steal one element from other procs.
+	// 从其他 P 中窃取对象
+	for i := 0; i < int(size); i++ {
+		l := indexLocal(locals, (pid+i+1)%int(size))
+		if x, _ := l.shared.popTail(); x != nil {
+			return x
+		}
+	}
+
+	// 尝试从victim cache中取对象。这发生在尝试从其他 P 的 poolLocal 偷去失败后，
+	// 因为这样可以使 victim 中的对象更容易被回收。
+	size = atomic.LoadUintptr(&p.victimSize)
+	if uintptr(pid) >= size {
+		return nil
+	}
+	locals = p.victim
+	l := indexLocal(locals, pid)
+	if x := l.private; x != nil {
+		l.private = nil
+		return x
+	}
+	for i := 0; i < int(size); i++ {
+		l := indexLocal(locals, (pid+i)%int(size))
+		if x, _ := l.shared.popTail(); x != nil {
+			return x
+		}
+	}
+
+	// 清空 victim cache。下次就不用再从这里找了
+	atomic.StoreUintptr(&p.victimSize, 0)
+
+	return nil
+}
+```
+
+![image-20220209143030369](https://raw.githubusercontent.com/ycchildcoder/markdown/main/image-20220209143030369.png)
+
+![image-20220209143148206](https://raw.githubusercontent.com/ycchildcoder/markdown/main/image-20220209143148206.png)
+
+
+
+
+
+![1112](https://raw.githubusercontent.com/ycchildcoder/markdown/main/1112.png)
+
+![1113](https://raw.githubusercontent.com/ycchildcoder/markdown/main/1113.png)
+
+![image-20220209143326686](https://raw.githubusercontent.com/ycchildcoder/markdown/main/image-20220209143326686.png)
+
+![1114](https://raw.githubusercontent.com/ycchildcoder/markdown/main/1114.png)
+
+
+
 ## pool_test
 
 通过 test 文件学习源码是一个很好的途径，因为它代表了“官方”的用法。更重要的是，测试用例会故意测试一些“坑”，学习这些坑，也会让自己在使用的时候就能学会避免。
@@ -191,6 +352,27 @@ func TestPoolNew(t *testing.T) {
 然后，调用 `Runtime_procPin()` 防止 goroutine 被强占，目的是保护接下来的一次 Put 和 Get 操作，使得它们操作的对象都是同一个 P 的“池子”。并且，这次调用 Get 的时候并没有调用 New，因为之前有一次 Put 的操作。
 
 最后，再次调用 Get 操作，因为没有“存货”，因此还是会再次调用 New 创建一个对象。
+
+## Pool 的数据结构
+
+```go
+type Pool struct {  
+   // 用于检测 Pool 池是否被 copy，因为 Pool 不希望被 copy。用这个字段可以在 go vet 工具中检测出被 copy（在编译期间就发现问题） 
+   noCopy noCopy  // A Pool must not be copied after first use.
+
+   // 实际指向 []poolLocal，数组大小等于 P 的数量；每个 P 一一对应一个 poolLocal
+   local     unsafe.Pointer 
+   localSize uintptr      // []poolLocal 的大小
+
+   // GC 时，victim 和 victimSize 会分别接管 local 和 localSize；
+   // victim 的目的是为了减少 GC 后冷启动导致的性能抖动，让分配对象更平滑；
+   victim     unsafe.Pointer 
+   victimSize uintptr       
+
+   // 对象初始化构造方法，使用方定义
+   New func() interface{}
+}
+```
 
 
 
@@ -250,3 +432,13 @@ func poolCleanup() {
 ```
 
 `poolCleanup` 会在 STW 阶段被调用。整体看起来，比较简洁。主要是将 local 和 victim 作交换，这样也就不致于让 GC 把所有的 Pool 都清空了，有 victim 在“兜底”。
+
+## 思考
+
+1、先 Put，或者主动 Put 会造成什么？
+首先，Put 任意类型的元素都不会报错，因为存储的是 interface{} 对象，且内部没有进行类型的判断和断言。如果 Put 在业务上不做限制，那么 Pool 池中就可能存在各种类型的数据，就导致在 Get 后的代码会非常繁琐（需要进行类型判断，否则有 panic 隐患）。另外，Get 得到的对象是随机的，缓存对象的回收也是随机的，所以先 Put 一个对象根本就没有实际作用。
+
+综上，sync.Pool 本质上可以是一个杂货铺，支持存放任何类型，所以 Get 出来和 Put 进去的对象类型要业务自己把控。
+
+2、如果只调用 Get 不调用 Put 会怎么样？
+首先就算不调用 Pool.Put，GC 也会去释放 Get 获取的对象（当没有人去再用它时）。但是只进行 Get 操作的话，就相当于一直在生成新的对象，Pool 池也失去了它最本质的功能。

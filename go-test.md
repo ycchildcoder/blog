@@ -728,3 +728,14 @@ ok      github.com/Q1mi/studygo/code_demo/test_demo/split       3.308s
 
 还可以通过在测试命令后添加`-cpu`参数如`go test -bench=. -cpu 1`来指定使用的CPU数量。
 
+参数：
+
+```go
+// 运行以IntSlice 结尾的测试例
+go test -bench=IntSlice$ .
+// 运行包含IntSlice 的测试例
+go test -bench=IntSlice .
+```
+
+
+
